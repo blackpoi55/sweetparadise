@@ -11,10 +11,18 @@ python -m pip install pyinstaller
 
 
 คำสั่งทำ exe
-python -m PyInstaller `
-  --noconfirm --clean `
-  --name SweetParadise `
-  --windowed --onefile `
+py -m pip install --upgrade pip
+py -m pip install pyinstaller
+
+py -3.13 -m PyInstaller --noconfirm --clean `
+  --name "SweetParadise" `
+  --onefile `
   --collect-all PySide6 `
-  --collect-submodules TikTokLive `
+  --collect-all TikTokLive `
+  --collect-all fastapi `
+  --collect-all starlette `
+  --collect-all anyio `
+  --collect-all h11 `
+  --hidden-import websockets.legacy.client `
+  --hidden-import websockets.legacy.server `
   sweet_paradise.py

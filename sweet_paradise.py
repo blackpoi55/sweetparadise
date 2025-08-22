@@ -1,15 +1,22 @@
 # sweet_paradise.py
-# Sweet Paradise Tiktok Live — v1.9.4 (animation-only, local-only, exe-ready, realtime game presence)
+# Sweet Paradise Tiktok Live — v1.9.4 (animation-only + local-only + game heartbeat + EXE-safe)
+# - Local-only API: รับเฉพาะ 127.0.0.1 / ::1
+# - EXE friendly: WindowsSelectorEventLoopPolicy, uvicorn http="h11", loop="asyncio", no signal handlers
+# - Default pose (sleep): เปิด/ปิดแล้วแจ้งเกมทันที; ปิดแล้วให้เกมหยุดท่านอน
+# - Realtime game link status: /game_ping จากเกม → ออนไลน์/ออฟไลน์
+# - เชื่อม / ยกเลิกเชื่อม Roblox + สถานะแบบจริง
+# - History + CSV
+# - API: /events, /confirm_link, /unlink_confirm, /game_ping
 
 import os, sys, json, time, threading, asyncio, csv
 from dataclasses import dataclass, asdict, field
 from typing import Any, Dict, List, Optional, Tuple, Deque
 from collections import deque
 
-# ---- Windows asyncio policy (สำคัญสำหรับไฟล์ .exe) ----
+# ---- EXE / Windows event loop ----
 if sys.platform.startswith("win"):
     try:
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())  # type: ignore
     except Exception:
         pass
 
@@ -125,7 +132,7 @@ class MappingRule:
         x = MappingRule()
         for k,v in d.items():
             if hasattr(x,k): setattr(x,k,v)
-        x.action = "animation"  # force migrate old actions
+        x.action = "animation"     # migrate legacy to animation
         return x
 
 @dataclass
@@ -359,7 +366,7 @@ class TikTokWorker(QtCore.QObject):
                 pass
             self.status_signal.emit("หยุดเชื่อมต่อ TikTok แล้ว")
 
-# ---------- API Server ----------
+# ---------- API Server (Local-only + Game Heartbeat + EXE-safe) ----------
 class ApiServer(QtCore.QObject):
     status_signal = Signal(str)
     event_signal  = Signal(dict)
@@ -369,7 +376,8 @@ class ApiServer(QtCore.QObject):
         self.cfg = cfg
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
-        self.last_game_seen: float = 0.0  # heartbeat เวลาเกมเรียก /events
+        self._last_game_ping: float = 0.0
+        self._game_online: bool = False
 
     def is_running(self) -> bool: return self._thread and self._thread.is_alive()
     def apply_config(self, cfg: AppConfig): self.cfg = cfg
@@ -383,22 +391,21 @@ class ApiServer(QtCore.QObject):
     def _run(self):
         app = FastAPI(title=f"{APP_NAME} API")
 
-        # อนุญาตแค่เครื่องเดียวกัน
-        def _ensure_local(req: Request):
+        # ----- Local-only guard -----
+        def _local_only(req: Request):
             host = (req.client.host if req and req.client else "")
-            if host not in ("127.0.0.1", "::1", "localhost"):
-                raise HTTPException(status_code=403, detail="Local machine only")
+            if host not in ("127.0.0.1", "::1"):
+                raise HTTPException(status_code=403, detail="Localhost only")
 
         @app.get("/events")
-        async def _events(request: Request, max:int=100):
-            _ensure_local(request)
-            self.last_game_seen = time.time()  # realtime presence
+        async def _events(req: Request, max:int=100):
+            _local_only(req)
             items = self.events.drain(max if max and max>0 else 100)
             return JSONResponse({"events": items, "remaining": self.events.size()})
 
         @app.post("/confirm_link")
-        async def _confirm(request: Request, payload: Dict[str,Any] = Body(...)):
-            _ensure_local(request)
+        async def _confirm(req: Request, payload: Dict[str,Any] = Body(...)):
+            _local_only(req)
             ev = {
                 "type":"link_confirmed",
                 "tiktok_user_id": payload.get("user_id"),
@@ -414,19 +421,60 @@ class ApiServer(QtCore.QObject):
             return {"ok": True}
 
         @app.post("/unlink_confirm")
-        async def _unlink_confirm(request: Request, payload: Dict[str,Any] = Body(None)):
-            _ensure_local(request)
+        async def _unlink_confirm(req: Request, payload: Dict[str,Any] = Body(None)):
+            _local_only(req)
             ev = {"type":"unlink_confirm"}
             self.events.push(ev); self.event_signal.emit(ev)
             self.status_signal.emit("ยืนยันยกเลิกเชื่อมจากเกมแล้ว")
             return {"ok": True}
 
-        # bind 127.0.0.1 เท่านั้น
-        config = uvicorn.Config(app, host="127.0.0.1", port=self.cfg.port, log_level="info")
+        # heartbeat จากเกม
+        @app.post("/game_ping")
+        async def _game_ping(req: Request, payload: Dict[str,Any] = Body(None)):
+            _local_only(req)
+            self._last_game_ping = time.time()
+            if not self._game_online:
+                self._game_online = True
+                self.events.push({"type":"game_online"}); self.event_signal.emit({"type":"game_online"})
+                self.status_signal.emit("เกมออนไลน์")
+            return {"ok": True}
+
+        # monitor game state
+        def monitor():
+            last_state = False
+            while not self._stop.is_set():
+                now = time.time()
+                online = (now - self._last_game_ping) <= 3.0 if self._last_game_ping else False
+                if online != last_state:
+                    last_state = online
+                    self._game_online = online
+                    typ = "game_online" if online else "game_offline"
+                    self.events.push({"type": typ}); self.event_signal.emit({"type": typ})
+                    self.status_signal.emit("เกมออนไลน์" if online else "เกมออฟไลน์")
+                time.sleep(0.5)
+
+        # uvicorn EXE-safe config
+        config = uvicorn.Config(
+            app,
+            host="127.0.0.1",
+            port=self.cfg.port,
+            log_level="info",
+            loop="asyncio",
+            http="h11",
+            lifespan="off",
+            workers=1
+        )
         server = uvicorn.Server(config)
+        server.install_signal_handlers = False  # <-- สำคัญมากเมื่อรันในเธรด/EXE
+        try:
+            server.install_signal_handlers = lambda: None  # ปิด signal handlers ใน thread/EXE
+        except Exception:
+            pass
+
         self.status_signal.emit(f"HTTP พร้อมใช้ที่ http://127.0.0.1:{self.cfg.port}")
 
         try:
+            threading.Thread(target=monitor, daemon=True).start()
             def watcher():
                 while not self._stop.is_set():
                     time.sleep(0.2)
@@ -434,8 +482,9 @@ class ApiServer(QtCore.QObject):
             threading.Thread(target=watcher, daemon=True).start()
             server.run()
         except Exception as e:
-            self.status_signal.emit(f"HTTP มีปัญหา: {e}")
-            write_log(f"HTTP error: {e}")
+            msg = f"HTTP มีปัญหา: {e}"
+            self.status_signal.emit(msg)
+            write_log(msg)
         finally:
             self.status_signal.emit("HTTP หยุดทำงานแล้ว")
 
@@ -452,11 +501,60 @@ QLineEdit, QSpinBox, QComboBox, QPlainTextEdit, QDoubleSpinBox { background: #16
 QLabel, QCheckBox { color: #cfd3dc; }
 """
 
+class RuleDialog(QtWidgets.QDialog):
+    def __init__(self, parent, trigger_type: str):
+        super().__init__(parent)
+        self.setWindowTitle("เพิ่มกฎใหม่")
+        self.trigger_type = trigger_type
+        self.setModal(True)
+        lay = QtWidgets.QFormLayout(self)
+
+        self.ed_pattern = QtWidgets.QLineEdit()
+        self.sp_min = QtWidgets.QSpinBox(); self.sp_min.setRange(0, 1_000_000); self.sp_min.setValue(10)
+        self.chk_streak = QtWidgets.QCheckBox("ยิงตอนจบคอมโบ (ของขวัญ)")
+
+        self.cb_anim = QtWidgets.QComboBox(); self.cb_anim.setEditable(True); self.cb_anim.lineEdit().setPlaceholderText("พิมพ์ หรือเลือกจากรายการ")
+        for e in EMOTES_UI:
+            self.cb_anim.addItem(f"{e['name']}  ({e['id']})", userData=e['id'])
+        self.sp_anim_secs = QtWidgets.QSpinBox(); self.sp_anim_secs.setRange(1, 120); self.sp_anim_secs.setValue(5)
+        self.sp_cd = QtWidgets.QDoubleSpinBox(); self.sp_cd.setRange(0, 3600); self.sp_cd.setDecimals(2); self.sp_cd.setValue(1.0)
+
+        if trigger_type == "gift":
+            lay.addRow("ชื่อของขวัญมีคำว่า:", self.ed_pattern)
+            lay.addRow("", self.chk_streak)
+        elif trigger_type == "like":
+            lay.addRow("หัวใจครบ (ครั้ง):", self.sp_min)
+        elif trigger_type == "comment":
+            lay.addRow("ข้อความมีคำว่า:", self.ed_pattern)
+
+        lay.addRow("ท่าเต้น (animation):", self.cb_anim)
+        lay.addRow("เต้นกี่วิ:", self.sp_anim_secs)
+        lay.addRow("คูลดาวน์รายคน (วินาที):", self.sp_cd)
+
+        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok|QtWidgets.QDialogButtonBox.Cancel)
+        lay.addRow(btns)
+        btns.accepted.connect(self.accept); btns.rejected.connect(self.reject)
+
+    def result_rule(self) -> MappingRule:
+        r = MappingRule()
+        r.trigger_type = self.trigger_type
+        if self.trigger_type in ("gift","comment"): r.pattern = self.ed_pattern.text().strip()
+        if self.trigger_type == "like": r.min_count = int(self.sp_min.value())
+        if self.trigger_type == "gift": r.streak_end_only = self.chk_streak.isChecked()
+        pick = self.cb_anim.currentData()
+        raw = self.cb_anim.currentText().strip()
+        anim_id = pick or raw
+        secs = int(self.sp_anim_secs.value())
+        r.action = "animation"
+        r.param = f"{anim_id}|{secs}"
+        r.cooldown_sec = float(self.sp_cd.value())
+        return r
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
-        self.resize(1180, 770)
+        self.resize(1180, 780)
         self.setStyleSheet(DARK_QSS)
 
         self.cfg: AppConfig = load_config()
@@ -470,33 +568,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.api.status_signal.connect(self._on_status)
         self.api.event_signal.connect(self._on_event)
 
-        # history
         self.history: List[Dict[str,Any]] = []
         self.total_gifts = 0
         self.total_likes = 0
         self.total_comments = 0
 
-        self._building_rules = False  # guard while populating table
-
+        self._building_rules = False
         self._build_ui()
         self._load_cfg_to_ui()
-
-        # realtime presence: อัปเดตทุก 700ms
-        self._game_online_prev = False
-        self.timer_presence = QtCore.QTimer(self)
-        self.timer_presence.setInterval(700)
-        self.timer_presence.timeout.connect(self._tick_presence)
-        self.timer_presence.start()
 
         if self.cfg.auto_start:
             self.handle_start()
 
-    # ----- build -----
     def _build_ui(self):
         central = QtWidgets.QWidget(); self.setCentralWidget(central)
         root = QtWidgets.QVBoxLayout(central)
 
-        # แถวบน
         row1 = QtWidgets.QHBoxLayout(); root.addLayout(row1)
         self.ed_user = QtWidgets.QLineEdit(); self.ed_user.setPlaceholderText("ชื่อ TikTok (ไม่ต้องใส่ @)")
         self.sp_port = QtWidgets.QSpinBox(); self.sp_port.setRange(1000,65535)
@@ -508,11 +595,10 @@ class MainWindow(QtWidgets.QMainWindow):
                   QtWidgets.QLabel("พอร์ต:"), self.sp_port,
                   self.btn_start, self.btn_stop,
                   QtWidgets.QLabel("สถานะเชื่อม:"), self.lbl_link_status,
-                  self.lbl_game_status]:
+                  QtWidgets.QLabel(" | "), QtWidgets.QLabel("สถานะเกม:"), self.lbl_game_status]:
             row1.addWidget(w)
         self.btn_start.clicked.connect(self.handle_start); self.btn_stop.clicked.connect(self.handle_stop)
 
-        # แถวสอง: link/unlink
         row2 = QtWidgets.QHBoxLayout(); root.addLayout(row2)
         self.ed_code = QtWidgets.QLineEdit(); self.ed_code.setPlaceholderText("รหัส 6 หลักจากในเกม")
         self.btn_link = QtWidgets.QPushButton("เชื่อม Roblox")
@@ -521,20 +607,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_link.clicked.connect(self._link_with_code); self.ed_code.returnPressed.connect(self._link_with_code)
         self.btn_unlink.clicked.connect(self._manual_unlink)
 
-        # Tabs
         self.tabs = QtWidgets.QTabWidget(); root.addWidget(self.tabs, 1)
 
-        # หน้าหลัก
         home = QtWidgets.QWidget(); self.tabs.addTab(home, "หน้าหลัก")
         vh = QtWidgets.QVBoxLayout(home)
         self.txt_log = QtWidgets.QPlainTextEdit(); self.txt_log.setReadOnly(True)
         vh.addWidget(self.txt_log, 1)
 
-        # ตั้งค่า
         st = QtWidgets.QWidget(); self.tabs.addTab(st, "ตั้งค่า")
         self._build_settings_tab(st)
 
-        # ทดสอบ (animation only)
         test = QtWidgets.QWidget(); self.tabs.addTab(test, "ทดสอบ")
         ft = QtWidgets.QFormLayout(test)
         self.cb_emote  = QtWidgets.QComboBox(); self.cb_emote.setEditable(True); self.cb_emote.lineEdit().setPlaceholderText("พิมพ์ AnimationId หรือเลือกจากรายการ")
@@ -546,7 +628,6 @@ class MainWindow(QtWidgets.QMainWindow):
         ft.addRow(self.btn_push)
         self.btn_push.clicked.connect(self._push_action)
 
-        # ประวัติ
         hist = QtWidgets.QWidget(); self.tabs.addTab(hist, "ประวัติ")
         vh2 = QtWidgets.QVBoxLayout(hist)
         self.lbl_hist_summary = QtWidgets.QLabel("ของขวัญ: 0 | หัวใจ: 0 | คอมเมนต์: 0")
@@ -716,13 +797,6 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.lbl_link_status.setText("ยังไม่เชื่อม Roblox")
 
-    # ----- realtime presence label -----
-    def _tick_presence(self):
-        online = (time.time() - self.api.last_game_seen) < 2.0
-        if online != self._game_online_prev:
-            self._game_online_prev = online
-        self.lbl_game_status.setText("เกม: ออนไลน์" if online else "เกม: ออฟไลน์")
-
     # ----- control -----
     def handle_start(self):
         self.cfg = self._collect_cfg(); save_config(self.cfg)
@@ -784,13 +858,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _add_history_row(self, ev: Dict[str,Any]):
         t = time.strftime("%H:%M:%S")
         row = self.tbl_hist.rowCount(); self.tbl_hist.insertRow(row)
-
         typ = ev.get("type","")
         name = ev.get("nickname") or ev.get("user_id") or ""
-        detail = ""
-        qty = ""
-        dia = ""
-        act = ""
+        detail = ""; qty=""; dia=""; act=""
         if typ == "gift":
             detail = ev.get("gift_name") or ""
             qty = str(ev.get("repeat_count") or "")
@@ -804,7 +874,6 @@ class MainWindow(QtWidgets.QMainWindow):
             p = a.get('param') or ''
             dur = a.get('duration')
             act = f"animation({p}|{dur}s)" if dur else f"animation({p})"
-
         for col,val in enumerate([t, typ, name, detail, qty, dia, act]):
             self.tbl_hist.setItem(row, col, QtWidgets.QTableWidgetItem(val))
         self.tbl_hist.scrollToBottom()
@@ -831,9 +900,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 for ev in self.history:
                     typ = ev.get("type","")
                     nick = ev.get("nickname") or ev.get("user_id") or ""
-                    detail = ""
-                    count = ""
-                    dia = ""
+                    detail = ""; count = ""; dia = ""
                     if typ=="gift":
                         detail = ev.get("gift_name") or ""
                         count = str(ev.get("repeat_count") or "")
@@ -854,7 +921,6 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             self._on_status(f"ส่งออกไม่สำเร็จ: {e}")
 
-    # ----- misc -----
     def _settings_changed(self, *args):
         self.cfg.auto_start = self.chk_auto.isChecked()
         self.cfg.max_queue = int(self.sp_queue.value())
@@ -865,7 +931,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.tk: self.tk.set_filters(self.cfg.enable_gifts, self.cfg.enable_likes, self.cfg.enable_comments)
         self._on_status("บันทึกการตั้งค่าแล้ว")
 
-    # ----- signals -----
     @Slot(str)
     def _on_status(self, msg: str):
         self.statusBar().showMessage(msg)
@@ -894,6 +959,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self._on_status("สถานะ: ยกเลิกเชื่อมเรียบร้อย (ยืนยันจากเกม)")
             return
 
+        if t == "game_online":
+            self.lbl_game_status.setText("ออนไลน์")
+            return
+        if t == "game_offline":
+            self.lbl_game_status.setText("ออฟไลน์")
+            return
+
         if t in ("gift","like","comment"):
             self.history.append(ev)
             if t=="gift":
@@ -912,61 +984,16 @@ class MainWindow(QtWidgets.QMainWindow):
             if t=="comment": extra = ev.get("comment") or ""
             act = ev.get("action")
             if act:
-                p = act.get('param',''); dur = act.get('duration')
-                extra += f" → action: animation({p}|{dur}s)" if dur else f" → action: animation({p})"
+                p = act.get('param','')
+                if act.get('duration'):
+                    extra += f" → action: animation({p}|{act.get('duration')}s)"
+                else:
+                    extra += f" → action: animation({p})"
             self._on_status(f"{t}: {who} {extra}")
 
         elif t=="action":
             a = ev.get("action",{})
             self._on_status(f"action(scope=owner): animation({a.get('param')})")
-
-# ---------- RuleDialog (animation only) ----------
-class RuleDialog(QtWidgets.QDialog):
-    def __init__(self, parent, trigger_type: str):
-        super().__init__(parent)
-        self.setWindowTitle("เพิ่มกฎใหม่")
-        self.trigger_type = trigger_type
-        self.setModal(True)
-        lay = QtWidgets.QFormLayout(self)
-
-        self.ed_pattern = QtWidgets.QLineEdit()
-        self.sp_min = QtWidgets.QSpinBox(); self.sp_min.setRange(0, 1_000_000); self.sp_min.setValue(10)
-        self.chk_streak = QtWidgets.QCheckBox("ยิงตอนจบคอมโบ (ของขวัญ)")
-
-        self.cb_anim = QtWidgets.QComboBox(); self.cb_anim.setEditable(True); self.cb_anim.lineEdit().setPlaceholderText("พิมพ์ หรือเลือกจากรายการ")
-        for e in EMOTES_UI:
-            self.cb_anim.addItem(f"{e['name']}  ({e['id']})", userData=e['id'])
-        self.sp_anim_secs = QtWidgets.QSpinBox(); self.sp_anim_secs.setRange(1, 120); self.sp_anim_secs.setValue(5)
-
-        self.sp_cd = QtWidgets.QDoubleSpinBox(); self.sp_cd.setRange(0, 3600); self.sp_cd.setDecimals(2); self.sp_cd.setValue(1.0)
-
-        if trigger_type == "gift":
-            lay.addRow("ชื่อของขวัญมีคำว่า:", self.ed_pattern)
-            lay.addRow("", self.chk_streak)
-        elif trigger_type == "like":
-            lay.addRow("หัวใจครบ (ครั้ง):", self.sp_min)
-        elif trigger_type == "comment":
-            lay.addRow("ข้อความมีคำว่า:", self.ed_pattern)
-
-        lay.addRow("ท่าเต้น (animation):", self.cb_anim)
-        lay.addRow("เต้นกี่วิ:", self.sp_anim_secs)
-        lay.addRow("คูลดาวน์รายคน (วินาที):", self.sp_cd)
-
-        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok|QtWidgets.QDialogButtonBox.Cancel)
-        lay.addRow(btns)
-        btns.accepted.connect(self.accept); btns.rejected.connect(self.reject)
-
-    def result_rule(self) -> MappingRule:
-        r = MappingRule()
-        r.trigger_type = self.trigger_type
-        if self.trigger_type in ("gift","comment"): r.pattern = self.ed_pattern.text().strip()
-        if self.trigger_type == "like": r.min_count = int(self.sp_min.value())
-        if self.trigger_type == "gift": r.streak_end_only = self.chk_streak.isChecked()
-        pick = self.cb_anim.currentData(); raw = self.cb_anim.currentText().strip()
-        anim_id = pick or raw; secs = int(self.sp_anim_secs.value())
-        r.action = "animation"; r.param = f"{anim_id}|{secs}"
-        r.cooldown_sec = float(self.sp_cd.value())
-        return r
 
 # ---------- Entry ----------
 def main():
